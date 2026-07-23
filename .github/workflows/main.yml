@@ -1,0 +1,246 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ci-chain
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Prepare folders
+        shell: powershell
+        run: |
+          mkdir C:\9Hits -Force | Out-Null
+          attrib +h C:\9Hits
+        
+          mkdir C:\9Hits\logs -Force | Out-Null
+  
+      - name: Cache ZIPs
+        uses: actions/cache@v4.2.3
+        with:
+          path: |
+            C:\9Hits\hits.zip
+            C:\9Hits\9hits-app-state.zip
+          key: zips-static-v1
+          restore-keys: |
+            zips-static-
+      - name: Download hits.zip if not cached
+        shell: powershell
+        run: |
+          if (!(Test-Path "C:\9Hits\hits.zip")) {
+            Invoke-WebRequest "https://ts.buzzheavier.com/d/hacm2dnkxy4g?v=wy159F5naDBtwzTGiLbYhROroWN3-Ko70sgOqFtQ631FYCMkmF9FuCX_TiGGX8tUsfwNDCkISIy4Qc2rILz_LogRUNFO8pdB5XOwxddOibMoGhchqdRpxUzXbynmOeq-FOXf" -OutFile "C:\9Hits\hits.zip"
+          } else {
+            Write-Host "hits.zip from cache"
+          }
+      - name: Download state if not cached
+        shell: powershell
+        run: |
+          if (!(Test-Path "C:\9Hits\9hits-app-state.zip")) {
+            Invoke-WebRequest "https://ts.buzzheavier.com/d/wznot61iyq63?v=bS1LXSzsf4NHe_Jxo6cbPlP78hXfNOnIsAmPnHLRe_jv7euHjrDp8XHoUnKo9uPFvidOZEyUpN3CjZdSKy1UdA3pRMBAg69f4yymeBEpY-pOtt_ah1PbEV1VT5HRT7ZIBrEz0l6Px1KX" -OutFile "C:\9Hits\9hits-app-state.zip"
+          } else {
+            Write-Host "state zip from cache"
+          }
+      - name: Setup 9Hits
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem C:\9Hits -Recurse -Filter "9hits.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (!$exe) {
+            Expand-Archive "C:\9Hits\hits.zip" C:\9Hits -Force
+          }
+      - name: Restore 9Hits state
+        shell: powershell
+        run: |
+          $local = "$env:LOCALAPPDATA\9hits-app"
+          $tmp = "C:\9Hits\temp"
+          Remove-Item $local -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item $local -ItemType Directory -Force | Out-Null
+          New-Item $tmp -ItemType Directory -Force | Out-Null
+          Expand-Archive "C:\9Hits\9hits-app-state.zip" $tmp -Force
+          if (Test-Path "$tmp\9hits-app") {
+            Copy-Item "$tmp\9hits-app\*" $local -Recurse -Force
+          } else {
+            Copy-Item "$tmp\*" $local -Recurse -Force
+          }
+          Remove-Item $tmp -Recurse -Force
+          Start-Sleep -Seconds 10
+      - name: Run with health check + graceful stop (4 hours)
+        shell: powershell
+        run: |
+          Add-Type @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          
+          public class WinApi {
+              [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+              [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+              public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+          }
+          "@
+          
+          function Get-WindowTitleByPid {
+            param([int]$TargetPid)
+            $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+            if (!$p) { return $null }
+            $titles = @()
+            foreach ($one in Get-Process | Where-Object { $_.Id -eq $TargetPid }) {
+              if ($one.MainWindowHandle -and $one.MainWindowHandle -ne 0) {
+                $sb = New-Object System.Text.StringBuilder 1024
+                [void][WinApi]::GetWindowText($one.MainWindowHandle, $sb, $sb.Capacity)
+                $t = $sb.ToString().Trim()
+                if ($t) { $titles += $t }
+              }
+            }
+            return ($titles | Select-Object -Unique)
+          }
+          function Test-9HitsState {
+            param([int]$TargetPid)
+            Write-Host "Checking 9Hits state..."
+            $checkProc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+            if (!$checkProc) {
+              Write-Host "9Hits process not found"
+              return $false
+            }
+            Write-Host "PID: $($checkProc.Id)"
+            Write-Host "Process: $($checkProc.ProcessName)"
+            Write-Host ("Started: {0}" -f $checkProc.StartTime)
+            $titles = Get-WindowTitleByPid -TargetPid $checkProc.Id
+            if ($titles -and $titles.Count -gt 0) {
+              Write-Host "Window title(s):"
+              $titles | ForEach-Object { Write-Host " - $_" }
+            } else {
+              Write-Host "No visible window title found"
+            }
+            try {
+              $p1 = Get-Process -Id $checkProc.Id -ErrorAction Stop
+              $cpu1 = $p1.CPU
+              Start-Sleep -Seconds 15
+              $p2 = Get-Process -Id $checkProc.Id -ErrorAction Stop
+              $cpu2 = $p2.CPU
+              $cpuDelta = [math]::Round(($cpu2 - $cpu1), 2)
+              $ramMb = [math]::Round($p2.WorkingSet64 / 1MB, 2)
+              Write-Host "Process CPU delta over 15s: $cpuDelta sec"
+              Write-Host "Process RAM: $ramMb MB"
+              $suspectIdle = $false
+              if ($cpuDelta -lt 0.05) {
+                $suspectIdle = $true
+                Write-Host "Possible idle sign: almost no CPU activity"
+              }
+              if ($titles) {
+                $joined = ($titles -join ' | ')
+                if ($joined -match 'IDLE|WAIT|PAUSE|STOP|LOGIN|SIGN IN') {
+                  $suspectIdle = $true
+                  Write-Host "Possible idle sign: window title suggests waiting/idle state"
+                }
+              }
+              if ($suspectIdle) {
+                Write-Host "RESULT: 9Hits is running, but may be IDLE / not actually working"
+                return $false
+              } else {
+                Write-Host "RESULT: 9Hits is running and shows signs of activity"
+                return $true
+              }
+            }
+            catch {
+              Write-Host "Failed while checking live activity: $($_.Exception.Message)"
+              return $true
+            }
+          }
+          function Start-App {
+            param([string]$Path)
+            Write-Host "Starting 9hits..."
+            $p = Start-Process -FilePath $Path -PassThru
+            Start-Sleep -Seconds 20
+            if ($p.HasExited) {
+              Write-Host "Process exited too early with code $($p.ExitCode)"
+              return $null
+            }
+            Write-Host "9hits started, pid=$($p.Id)"
+            [void](Test-9HitsState -TargetPid $p.Id)
+            return $p
+          }
+          $exe = Get-ChildItem C:\9Hits -Recurse -Filter "9hits.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (!$exe) {
+            Write-Host "9hits.exe not found"
+            exit 1
+          }
+          $exePath = $exe.FullName
+          $proc = $null
+          
+          
+          $end = (Get-Date).AddHours(3).AddMinutes(30)
+          try {
+            $proc = Start-App -Path $exePath
+            if (!$proc) { exit 1 }
+            while ((Get-Date) -lt $end) {
+              if ($proc.HasExited) {
+                Write-Host "9hits crashed, restart after cooldown..."
+                Start-Sleep -Seconds 30
+                $proc = Start-App -Path $exePath
+                if (!$proc) { exit 1 }
+              } else {
+                Write-Host "9hits running pid=$($proc.Id)"
+              }
+              Start-Sleep -Seconds 20
+            }
+          }
+          finally {
+            if ($proc -and !$proc.HasExited) {
+              Write-Host "Stopping 9hits gracefully..."
+              try { $proc.CloseMainWindow() | Out-Null } catch {}
+              Start-Sleep -Seconds 15
+              if (!$proc.HasExited) {
+                Write-Host "Force kill"
+                try { $proc.Kill() } catch {}
+              }
+            }
+            Start-Sleep -Seconds 5
+          }
+      - name: Resource usage summary
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Stats"
+          $cpuSamples = Get-Counter "\Processor(_Total)\% Processor Time" -SampleInterval 1 -MaxSamples 5
+          $vals = $cpuSamples.CounterSamples | ForEach-Object { $_.CookedValue }
+          $cpuAvg = [math]::Round(($vals | Measure-Object -Average).Average, 1)
+          $cpuMax = [math]::Round(($vals | Measure-Object -Maximum).Maximum, 1)
+          $memFree = (Get-Counter "\Memory\Available MBytes").CounterSamples.CookedValue
+          $memTotal = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB
+          $memUsed = $memTotal - $memFree
+          Write-Host "CPU avg $cpuAvg%"
+          Write-Host "CPU peak $cpuMax%"
+          Write-Host ("RAM used {0:N2} MB free {1:N2} MB total {2:N2} MB" -f $memUsed, $memFree, $memTotal)
+      
+      - name: Wait before next run
+        if: success()
+        run: sleep 31
+
+      - name: Trigger next run
+        shell: bash
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 30
+
+          curl -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main"}'
